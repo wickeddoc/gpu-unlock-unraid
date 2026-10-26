@@ -1,8 +1,8 @@
 <?xml version='1.0' standalone='yes'?>
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "gpu-unlock">
-<!ENTITY author    "local">
-<!ENTITY version   "2026.10.26">
+<!ENTITY author    "wickeddoc">
+<!ENTITY version   "2026.10.26a">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/wickeddoc/gpu-unlock-unraid/master/plugin/gpu-unlock.plg">
 <!ENTITY plugin    "/boot/config/plugins/&name;">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
@@ -15,13 +15,17 @@
     /boot/config/plugins/gpu-unlock/packages/firmware/gpu-unlock-firmware-<nv>-noarch-1.txz
   Ordering: Unraid installs /boot/config/plugins/*.plg at boot in name order, so "gpu-unlock.plg" runs before
   "nvidia-driver.plg" (which does modprobe nvidia). Keep this file name.
-  pluginURL only matters for the Plugins page's update check; point it at your own copy or leave it.
+  Install from the Plugins page with the pluginURL below; the Plugins page then offers updates whenever the
+  version entity above changes on master.
 -->
 <PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;"
         launch="Settings/GPUUnlock" icon="unlock-alt" min="6.12.0"
-        support="https://github.com/Zagitta/gpu-unlock/issues">
+        support="https://github.com/wickeddoc/gpu-unlock-unraid/issues">
 
 <CHANGES>
+###2026.10.26a
+- Published at github.com/wickeddoc/gpu-unlock-unraid: author/support fields, no functional change.
+
 ###2026.10.26
 - First version. Installs the locally built gpu-unlock module + firmware packages at boot and loads
   gpu_unlock before the nvidia-driver plugin. Settings page under Settings - User Utilities.

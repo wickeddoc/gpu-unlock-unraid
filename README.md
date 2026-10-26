@@ -41,19 +41,29 @@ Needs: Unraid 7.x with Docker enabled, the nvidia-driver plugin (or vfio passthr
 for the build, ~3 GB of disk for the kernel tree. Run everything as root in a terminal (SSH or the web terminal).
 
 ```bash
-# 1. put this repo on a real disk path (not /mnt/user/..., the FUSE layer is slow for kernel trees)
+# 1. clone to a real disk path (not /mnt/user/..., the FUSE layer is slow for kernel trees)
 mkdir -p /mnt/cache/appdata && cd /mnt/cache/appdata
-unzip /path/to/gpu-unlock-unraid.zip && cd gpu-unlock-unraid
+git clone https://github.com/wickeddoc/gpu-unlock-unraid && cd gpu-unlock-unraid
 
 # 2. build for the running kernel: ~5-10 min; downloads linux-x.y.z.tar.xz (~150 MB) and, once,
 #    the NVIDIA inputs for the firmware (a few hundred MB). Output in ./out, cache in ./cache.
 ./build/run.sh
 
-# 3. copy the packages + plugin to the flash and install the plugin
+# 3. copy the packages to the flash and install the plugin
 ./install.sh
 
 # 4. reboot (the first time, do a full power-off / power-on, see "Cold boot" below)
 ```
+
+The plugin itself can also be installed the usual Unraid way, from **Plugins > Install Plugin** with
+
+```
+https://raw.githubusercontent.com/wickeddoc/gpu-unlock-unraid/master/plugin/gpu-unlock.plg
+```
+
+It installs fine before any package exists (it just reports "No module for kernel ..." until you build and copy
+them), and the Plugins page then offers updates whenever a new plugin version is pushed. `install.sh` still does
+the package copying; with the plugin already installed it simply re-runs its start step.
 
 After the reboot check **Settings > User Utilities > GPU Unlock** (or `dmesg | grep gpu_unlock`): every target card
 should show `gpu_unlock: unlocked`, and you get an Unraid notification "Unlocked N card(s)". Then confirm with a
@@ -124,8 +134,9 @@ its current driver and its last `gpu_unlock` message, and the recent kernel log 
 * **Uninstall:** Plugins page or `plugin remove gpu-unlock.plg`. This unloads the module and removes the installed
   packages; the built `.txz` files stay in `/boot/config/plugins/gpu-unlock/packages/` (delete if unwanted).
   Unlocked cards stay unlocked until they lose power.
-* **Update check on the Plugins page** shows "not available"/"cannot check" because `pluginURL` points at a
-  placeholder. If you push this repo to GitHub, set `pluginURL` in `plugin/gpu-unlock.plg` to your raw URL.
+* **Plugin updates:** the `.plg` carries a `version` (date); the Plugins page shows an update when the file on
+  `master` has a newer one. Bump it (e.g. `2026.10.26a`) in any commit that changes `plugin/gpu-unlock.plg`.
+  Packages are never downloaded by the plugin; they always come from your own build in `packages/`.
 * The kernel in Unraid 7.3.3 was built with gcc 16.2; the container uses Debian 13's gcc 14.2. That is fine for
   an out-of-tree module (no MODVERSIONS, no signature, no compiler check at insmod; only the vermagic has to match,
   and the build verifies it). `BASE_IMAGE=gcc:16 ./build/run.sh` if you want the same compiler anyway.
