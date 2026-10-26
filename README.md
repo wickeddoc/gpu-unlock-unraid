@@ -9,6 +9,18 @@ Supported cards (per the project): GeForce GA102/GA103/GA104/GA106, e.g. RTX 306
 Read the project README for the tested-cards table, the gains to expect (dense GEMM / LLM prefill / diffusion up,
 LLM decode unchanged) and the hardware caveats. This is unofficial; use at your own risk.
 
+## Disclaimer
+
+The build scripts, the Unraid plugin and this README were written with **Claude Code** (Anthropic's model
+Claude Fable 5.1) on 26 October 2026, at the request of and reviewed by the repository owner. The AI's work was
+checked as far as a sandbox allows: `gpu_unlock.ko` was compiled against the real `6.18.54-Unraid` kernel config
+(Unraid 7.3.3) with a matching vermagic, and the plugin's control script was exercised against a simulated Unraid
+layout. It was **not** run on real hardware before publication, and the firmware generation step was not run in
+the sandbox. Read the scripts before you run them, expect rough edges, and report problems in this repo's issues.
+
+This project is not affiliated with or endorsed by Zagitta (gpu-unlock), Lime Technology (Unraid), NVIDIA or
+Anthropic. It modifies how your GPU's firmware is started; everything you do with it is at your own risk.
+
 ## How it fits Unraid
 
 * Unraid runs from RAM; nothing survives a reboot except `/boot` (the USB stick). Since 6.9.1 `/lib/modules` and
