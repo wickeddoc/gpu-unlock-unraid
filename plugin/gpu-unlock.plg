@@ -1,0 +1,362 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "gpu-unlock">
+<!ENTITY author    "local">
+<!ENTITY version   "2026.10.26">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/CHANGE-ME/gpu-unlock-unraid/main/plugin/gpu-unlock.plg">
+<!ENTITY plugin    "/boot/config/plugins/&name;">
+<!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
+]>
+
+<!--
+  GPU Unlock for Unraid: loads Zagitta's gpu_unlock kernel module (Ampere FP16/BF16 issue-rate unlock) at boot,
+  BEFORE the nvidia-driver plugin loads nvidia. The packages it installs are built by build/ in this repo:
+    /boot/config/plugins/gpu-unlock/packages/<uname -r>/gpu-unlock-module-<ver>-<uname -r>-1.txz
+    /boot/config/plugins/gpu-unlock/packages/firmware/gpu-unlock-firmware-<nv>-noarch-1.txz
+  Ordering: Unraid installs /boot/config/plugins/*.plg at boot in name order, so "gpu-unlock.plg" runs before
+  "nvidia-driver.plg" (which does modprobe nvidia). Keep this file name.
+  pluginURL only matters for the Plugins page's update check; point it at your own copy or leave it.
+-->
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;"
+        launch="Settings/GPUUnlock" icon="unlock-alt" min="6.12.0"
+        support="https://github.com/Zagitta/gpu-unlock/issues">
+
+<CHANGES>
+###2026.10.26
+- First version. Installs the locally built gpu-unlock module + firmware packages at boot and loads
+  gpu_unlock before the nvidia-driver plugin. Settings page under Settings - User Utilities.
+</CHANGES>
+
+<!-- start clean: the plugin manager skips files that already exist -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf &emhttp;
+mkdir -p &plugin;/packages/firmware
+</INLINE>
+</FILE>
+
+<!-- settings defaults (overridden by /boot/config/plugins/gpu-unlock/gpu-unlock.cfg) -->
+<FILE Name="&emhttp;/default.cfg">
+<INLINE>
+ENABLED="yes"
+TARGETS="all"
+VFIO_RELEASE="no"
+RESUME="yes"
+</INLINE>
+</FILE>
+
+<!-- control script -->
+<FILE Name="&emhttp;/scripts/gpu-unlock" Mode="0755">
+<INLINE><![CDATA[
+#!/bin/bash
+# gpu-unlock: control script for the "GPU Unlock" Unraid plugin.
+#
+#   gpu-unlock start    install the packages for the running kernel and load gpu_unlock (boot / plugin install)
+#   gpu-unlock apply    settings page "Apply": settings only change what the next boot does
+#   gpu-unlock stop     unload the module (the unlock itself persists until the cards lose power)
+#   gpu-unlock status   plain-text status for the settings page
+#
+# The module only acts on cards no driver has claimed yet, and refuses a card any driver initialised since
+# power-on. So this must run before "modprobe nvidia"; on Unraid that is the nvidia-driver plugin, which is
+# installed after this one at boot (plugins install in file-name order).
+
+PLG=gpu-unlock
+CFGDIR=/boot/config/plugins/$PLG
+CFG=$CFGDIR/$PLG.cfg
+DEFCFG=/usr/local/emhttp/plugins/$PLG/default.cfg
+PKGROOT=$CFGDIR/packages
+KR=$(uname -r)
+PKGDB=/var/lib/pkgtools/packages
+[ -d "$PKGDB" ] || PKGDB=/var/log/packages
+KO=/lib/modules/$KR/extra/gpu_unlock.ko
+# GA102 / GA104 / GA103 / GA106 GeForce IDs the module accepts (kernel/gpu_unlock/main.c), for display only
+SUPPORTED_IDS=" 2200 2203 2204 2205 2206 2207 2208 220a 220d 2216 222b 222f 2480 2482 2483 2484 2486 2487 2488 2489 248a 248c 248d 248e 249c 249d 249f 24a0 24a4 24ac 24ad 24af 24bf 24c0 24c7 24c8 24c9 24dc 24dd 24df 24e0 2414 2501 2503 2504 2505 2507 2508 2509 252f 2544 2520 2560 "
+
+log() { logger -t gpu-unlock -- "$*"; echo "$*"; }
+notify() { /usr/local/emhttp/webGui/scripts/notify -e "GPU Unlock" -s "$1" -d "$2" -i "${3:-normal}" -l "/Settings/GPUUnlock" >/dev/null 2>&1; }
+
+# read KEY="value" from the user config, falling back to the defaults (never source the file)
+cfg() {
+  local v
+  v=$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"\r')
+  [ -z "$v" ] && v=$(grep -E "^$1=" "$DEFCFG" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"\r')
+  echo "$v"
+}
+ENABLED=$(cfg ENABLED); TARGETS=$(cfg TARGETS); VFIO_RELEASE=$(cfg VFIO_RELEASE); RESUME=$(cfg RESUME)
+TARGETS=$(echo "$TARGETS" | tr -d ' ' | tr 'A-F' 'a-f')
+[ -z "$TARGETS" ] && TARGETS=all
+[ "$RESUME" = no ] && RESUME_PARAM=0 || RESUME_PARAM=1
+targets_valid() { [ "$TARGETS" = all ] || [[ $TARGETS =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f](,[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])*$ ]]; }
+
+loaded() { [ -d /sys/module/gpu_unlock ]; }
+module_pkg() { ls -1 "$PKGROOT/$KR"/gpu-unlock-module-*-"$KR"-*.txz 2>/dev/null | sort -V | tail -1; }
+firmware_pkg() { ls -1 "$PKGROOT/firmware"/gpu-unlock-firmware-*.txz 2>/dev/null | sort -V | tail -1; }
+pkg_installed() { [ -e "$PKGDB/$(basename "$1" .txz)" ]; }
+pkg_verify() { # checks the .sha256 written by build.sh when present
+  [ -f "$1.sha256" ] || return 0
+  (cd "$(dirname "$1")" && sha256sum -c --quiet "$(basename "$1").sha256" >/dev/null 2>&1)
+}
+
+# supported NVIDIA cards: "<bdf> <device-id> <driver|none>"
+cards() {
+  local d v id drv
+  for d in /sys/bus/pci/devices/*; do
+    v=$(cat "$d/vendor" 2>/dev/null); [ "$v" = 0x10de ] || continue
+    id=$(cat "$d/device" 2>/dev/null); id=${id#0x}
+    [[ $SUPPORTED_IDS == *" $id "* ]] || continue
+    if [ -e "$d/driver" ]; then drv=$(basename "$(readlink -f "$d/driver")"); else drv=none; fi
+    echo "$(basename "$d") $id $drv"
+  done
+}
+target_cards() {
+  if [ "$TARGETS" = all ]; then cards; else cards | grep -E "^(${TARGETS//,/|}) " || true; fi
+}
+
+install_pkgs() {
+  local modpkg fwpkg p
+  modpkg=$(module_pkg); fwpkg=$(firmware_pkg)
+  if [ -z "$modpkg" ]; then
+    log "no gpu-unlock module package for kernel $KR in $PKGROOT/$KR"
+    notify "No module for kernel $KR" "No gpu-unlock-module-*-$KR-1.txz in $PKGROOT/$KR. Build one for this Unraid kernel (build/run.sh in the gpu-unlock-unraid repo), copy it there and reboot. The cards stay at the stock BF16 rate until then." warning
+    return 1
+  fi
+  if [ -z "$fwpkg" ]; then
+    log "no gpu-unlock firmware package in $PKGROOT/firmware"
+    notify "No firmware package" "No gpu-unlock-firmware-*.txz in $PKGROOT/firmware. Build it (build/run.sh), copy it there and reboot." warning
+    return 1
+  fi
+  for p in "$fwpkg" "$modpkg"; do
+    if ! pkg_verify "$p"; then
+      log "checksum mismatch: $p"
+      notify "Package checksum mismatch" "$(basename "$p") does not match its .sha256 file. Rebuild or recopy it." alert
+      return 1
+    fi
+    if ! pkg_installed "$p"; then
+      log "installing $(basename "$p")"
+      upgradepkg --install-new "$p" >/dev/null || { log "installpkg failed for $p"; notify "Package install failed" "$(basename "$p") failed to install, see the system log." alert; return 1; }
+    fi
+  done
+  depmod -a "$KR" 2>/dev/null
+  [ -f "$KO" ] || { log "$KO missing after install"; notify "Module missing" "$KO is not in the installed package." alert; return 1; }
+  if [ "$(modinfo -F vermagic "$KO" 2>/dev/null | cut -d' ' -f1)" != "$KR" ]; then
+    log "module vermagic does not match $KR"; notify "Module does not match kernel" "The packaged gpu_unlock.ko was built for another kernel. Rebuild for $KR." alert; return 1
+  fi
+  local f
+  for f in $(modinfo -F firmware "$KO" 2>/dev/null); do
+    [ -f "/lib/firmware/$f" ] || { log "firmware /lib/firmware/$f missing"; notify "Firmware missing" "/lib/firmware/$f is missing; rebuild the firmware package for this module version." alert; return 1; }
+  done
+  return 0
+}
+
+# dmesg lines from the module, since the given line count
+new_dmesg() { dmesg 2>/dev/null | grep -F gpu_unlock | tail -n +"$(( $1 + 1 ))"; }
+
+start() {
+  if [ "$ENABLED" != yes ]; then log "disabled in settings, nothing loaded"; return 0; fi
+  if ! targets_valid; then
+    log "invalid Targets setting '$TARGETS' (use 'all' or comma-separated PCI addresses like 0000:21:00.0)"
+    notify "Invalid Targets setting" "'$TARGETS' is not 'all' or a comma-separated list of PCI addresses. Nothing was unlocked." warning
+    return 0
+  fi
+  install_pkgs || return 0
+  if loaded; then log "gpu_unlock already loaded"; return 0; fi
+  local c bdf id drv
+  if [ -z "$(target_cards)" ]; then
+    log "no supported (GA102/GA103/GA104/GA106) card matches targets=$TARGETS; not loading"
+    return 0
+  fi
+  if lsmod | grep -q '^nvidia ' || target_cards | grep -q ' nvidia$'; then
+    log "nvidia is already loaded; gpu_unlock must run before it. Packages are installed; the unlock runs at the next boot, ahead of the nvidia-driver plugin."
+    notify "Reboot to unlock" "gpu-unlock is installed, but the nvidia driver is already bound to the card(s). The unlock runs on the next boot, before the nvidia-driver plugin loads nvidia." normal
+    return 0
+  fi
+  if target_cards | grep -q ' nouveau$'; then
+    log "a target card is bound to nouveau; blacklist it (echo 'blacklist nouveau' > /boot/config/modprobe.d/nouveau.conf) and reboot"
+    notify "nouveau is bound to a card" "Create /boot/config/modprobe.d/nouveau.conf containing 'blacklist nouveau' and reboot; gpu_unlock cannot touch a card another driver owns." warning
+    return 0
+  fi
+  # optional: cards reserved for VMs are already bound to vfio-pci this early; release them for the unlock
+  local released=()
+  if [ "$VFIO_RELEASE" = yes ]; then
+    while read -r bdf id drv; do
+      [ "$drv" = vfio-pci ] || continue
+      if echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null; then released+=("$bdf"); log "released $bdf from vfio-pci for the unlock"; fi
+    done < <(target_cards)
+  fi
+  local before ok=0
+  before=$(dmesg 2>/dev/null | grep -cF gpu_unlock)
+  log "loading gpu_unlock targets=$TARGETS resume=$RESUME_PARAM"
+  if modprobe gpu_unlock targets="$TARGETS" resume="$RESUME_PARAM"; then ok=1; else log "modprobe gpu_unlock failed ($?)"; fi
+  for bdf in "${released[@]}"; do
+    echo "$bdf" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null && log "rebound $bdf to vfio-pci" || log "WARNING: could not rebind $bdf to vfio-pci"
+  done
+  local lines unlocked failed
+  lines=$(new_dmesg "$before")
+  [ -n "$lines" ] && echo "$lines" | while read -r l; do log "$l"; done
+  unlocked=$(echo "$lines" | grep -c 'gpu_unlock: unlocked$')
+  failed=$(echo "$lines" | grep -c 'unlock failed\|firmware load failed\|no supported card')
+  if [ "$ok" = 1 ] && [ "$unlocked" -gt 0 ] && [ "$failed" -eq 0 ]; then
+    notify "Unlocked $unlocked card(s)" "gpu_unlock unlocked $unlocked card(s) before the nvidia driver. Details: Settings - User Utilities - GPU Unlock." normal
+  elif [ "$ok" = 1 ] && [ "$unlocked" -gt 0 ]; then
+    notify "Unlocked $unlocked card(s), $failed problem(s)" "Some cards were not unlocked. See Settings - User Utilities - GPU Unlock." warning
+  else
+    notify "Unlock did not happen" "gpu_unlock loaded but unlocked nothing (or failed to load). See Settings - User Utilities - GPU Unlock and the system log." warning
+  fi
+  return 0
+}
+
+apply() {
+  log "settings saved: enabled=$ENABLED targets=$TARGETS vfio_release=$VFIO_RELEASE resume=$RESUME"
+  if loaded; then
+    [ -w /sys/module/gpu_unlock/parameters/resume ] && echo "$RESUME_PARAM" > /sys/module/gpu_unlock/parameters/resume
+    log "module is loaded; the other settings take effect at the next boot (the unlock can only run before nvidia binds the cards)"
+  else
+    start
+  fi
+}
+
+stop() {
+  if loaded; then rmmod gpu_unlock && log "gpu_unlock unloaded (cards that were unlocked stay unlocked until they lose power)"; fi
+}
+
+status() {
+  local modpkg fwpkg
+  modpkg=$(module_pkg); fwpkg=$(firmware_pkg)
+  echo "kernel:   $KR"
+  echo "settings: enabled=$ENABLED targets=$TARGETS vfio_release=$VFIO_RELEASE resume=$RESUME"
+  if [ -n "$modpkg" ]; then echo "module package:   $(basename "$modpkg") $(pkg_installed "$modpkg" && echo '(installed)' || echo '(not installed)')"; else echo "module package:   NONE for $KR in $PKGROOT/$KR - build one"; fi
+  if [ -n "$fwpkg" ]; then echo "firmware package: $(basename "$fwpkg") $(pkg_installed "$fwpkg" && echo '(installed)' || echo '(not installed)')"; else echo "firmware package: NONE in $PKGROOT/firmware - build one"; fi
+  [ -f "$PKGROOT/$KR/BUILD-INFO" ] && sed 's/^/  /' "$PKGROOT/$KR/BUILD-INFO"
+  if loaded; then
+    echo "module:   loaded (version $(cat /sys/module/gpu_unlock/version 2>/dev/null), targets=$(cat /sys/module/gpu_unlock/parameters/targets 2>/dev/null), resume=$(cat /sys/module/gpu_unlock/parameters/resume 2>/dev/null))"
+  elif [ -f "$KO" ]; then echo "module:   installed for $KR, not loaded"
+  else echo "module:   not installed"; fi
+  echo "nvidia:   $(lsmod | grep -q '^nvidia ' && echo loaded || echo 'not loaded')"
+  echo "cards (GA102/GA103/GA104/GA106 GeForce only):"
+  local any=0 bdf id drv last
+  while read -r bdf id drv; do
+    any=1
+    last=$(dmesg 2>/dev/null | grep -F "$bdf: gpu_unlock:" | tail -1 | sed 's/^.*gpu_unlock: //')
+    printf '  %s  10de:%s  driver=%-9s %s\n' "$bdf" "$id" "$drv" "${last:+[$last]}"
+  done < <(cards)
+  [ "$any" = 0 ] && echo "  none found"
+  echo "recent gpu_unlock kernel messages:"
+  dmesg 2>/dev/null | grep -F gpu_unlock | tail -25 | sed 's/^/  /'
+  [ "$(dmesg 2>/dev/null | grep -cF gpu_unlock)" = 0 ] && echo "  (none since boot)"
+  return 0
+}
+
+case "$1" in
+  start) start ;;
+  apply) apply ;;
+  stop) stop ;;
+  status) status ;;
+  *) echo "usage: $0 {start|apply|stop|status}"; exit 1 ;;
+esac
+]]></INLINE>
+</FILE>
+
+<!-- settings page: Settings - User Utilities - GPU Unlock -->
+<FILE Name="&emhttp;/GPUUnlock.page">
+<INLINE><![CDATA[
+Menu="Utilities"
+Title="GPU Unlock (Ampere BF16)"
+Icon="unlock-alt"
+Tag="unlock-alt"
+---
+<?php
+$plugin = 'gpu-unlock';
+$cfg = parse_plugin_cfg($plugin);
+$status = htmlspecialchars(shell_exec("/usr/local/emhttp/plugins/$plugin/scripts/gpu-unlock status 2>&1") ?? '');
+?>
+<style>pre.gpuunlock{background:var(--background-color,#1c1b1b);padding:10px;white-space:pre-wrap}</style>
+
+Loads **gpu_unlock** ([Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock)) at boot, before the nvidia-driver plugin loads `nvidia`.
+It writes the speed selectors that double the FP16/BF16 issue rate of GA102/GA103/GA104/GA106 GeForce cards (RTX 3060 12GB, 3070, 3080, 3090, 3090 Ti...) to their professional equivalents. Matrix-heavy work (LLM prefill, diffusion, dense GEMM) gets faster; memory-bound work (LLM decode) does not.
+
+The module only acts on cards no driver has touched since power-on, so **changes here take effect at the next boot**. A warm reboot is normally enough; if the log says "card already initialised since power on", power the server off and on.
+
+<form markdown="1" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#file" value="<?=$plugin?>/<?=$plugin?>.cfg">
+<input type="hidden" name="#command" value="/plugins/<?=$plugin?>/scripts/gpu-unlock">
+<input type="hidden" name="#arg[1]" value="apply">
+
+Enable at boot:
+: <select name="ENABLED">
+  <?=mk_option($cfg['ENABLED'], "yes", "Yes")?>
+  <?=mk_option($cfg['ENABLED'], "no", "No")?>
+  </select>
+
+> **No** leaves the packages alone and does not load the module.
+
+Cards to unlock (targets):
+: <input type="text" name="TARGETS" value="<?=htmlspecialchars($cfg['TARGETS'])?>" class="wide">
+
+> `all` = every supported, unclaimed card. Or a comma-separated list of PCI addresses as shown in the status below (e.g. `0000:21:00.0,0000:22:00.0`).
+
+Release vfio-pci cards for the unlock:
+: <select name="VFIO_RELEASE">
+  <?=mk_option($cfg['VFIO_RELEASE'], "no", "No")?>
+  <?=mk_option($cfg['VFIO_RELEASE'], "yes", "Yes (experimental)")?>
+  </select>
+
+> Cards bound to vfio-pci for VM passthrough are already claimed when this runs. **Yes** unbinds them, runs the unlock, and binds them back to vfio-pci (the unlock survives the FLR a VM start does; a card's power-off does not). Only enable this while no VM is running at boot.
+
+Re-unlock after resume from suspend:
+: <select name="RESUME">
+  <?=mk_option($cfg['RESUME'], "yes", "Yes (module default)")?>
+  <?=mk_option($cfg['RESUME'], "no", "No")?>
+  </select>
+
+&nbsp;
+: <input type="submit" value="Apply"><input type="button" value="Done" onclick="done()">
+</form>
+
+### Status
+<pre class="gpuunlock"><?=$status?></pre>
+
+### After an Unraid update
+The module is built for one exact kernel. After an Unraid upgrade the plugin finds no package for the new kernel, leaves the cards at the stock rate and sends a notification; rebuild with `build/run.sh` from the gpu-unlock-unraid repo (the firmware package is kernel-independent and is kept), copy the new `.txz` + `.sha256` into `/boot/config/plugins/gpu-unlock/packages/<uname -r>/` and reboot.
+
+To check the effect, compare a dense BF16 GEMM benchmark before and after (see the project README's numbers); `nvidia-smi` does not show the issue rate.
+]]></INLINE>
+</FILE>
+
+<FILE Name="&emhttp;/README.md">
+<INLINE><![CDATA[
+**GPU Unlock (Ampere BF16)**
+
+Loads Zagitta's gpu_unlock kernel module at boot, before the nvidia-driver plugin, to unlock the full
+FP16/BF16 issue rate of GA102/GA103/GA104/GA106 GeForce cards. Uses locally built packages from
+/boot/config/plugins/gpu-unlock/packages. Settings: Settings > User Utilities > GPU Unlock.
+]]></INLINE>
+</FILE>
+
+<!-- install / every boot (before nvidia-driver.plg): install the packages for this kernel and load the module.
+     Always exits 0: a failing Run moves the plugin to plugins-error at boot. -->
+<FILE Run="/bin/bash">
+<INLINE><![CDATA[
+/usr/local/emhttp/plugins/gpu-unlock/scripts/gpu-unlock start || true
+echo ""
+echo "GPU Unlock plugin installed. Settings > User Utilities > GPU Unlock"
+exit 0
+]]></INLINE>
+</FILE>
+
+<!-- uninstall: unload, remove the installed packages, keep the built .txz files on the flash -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE><![CDATA[
+/usr/local/emhttp/plugins/gpu-unlock/scripts/gpu-unlock stop 2>/dev/null
+PKGDB=/var/lib/pkgtools/packages; [ -d "$PKGDB" ] || PKGDB=/var/log/packages
+for p in "$PKGDB"/gpu-unlock-module-* "$PKGDB"/gpu-unlock-firmware-*; do
+  [ -e "$p" ] && removepkg "$(basename "$p")" >/dev/null 2>&1
+done
+rm -rf /usr/local/emhttp/plugins/gpu-unlock
+rm -f /boot/config/plugins/gpu-unlock/gpu-unlock.cfg
+echo "GPU Unlock removed. The built packages were left in /boot/config/plugins/gpu-unlock/packages (delete that"
+echo "directory if you don't want them). Unlocked cards stay unlocked until they lose power."
+exit 0
+]]></INLINE>
+</FILE>
+
+</PLUGIN>
